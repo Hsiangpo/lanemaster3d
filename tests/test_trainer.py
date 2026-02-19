@@ -6,13 +6,45 @@ from types import SimpleNamespace
 
 import torch
 
-from lanemaster3d.engine import trainer
-from lanemaster3d.engine.trainer import _average_metric_list, _compute_uncertainty_loss, _load_gt_from_meta, _save_checkpoint, _should_run_official_eval
+from lanemaster3d.engine import evaluator, trainer
+from lanemaster3d.engine.trainer import (
+    DistContext,
+    _average_metric_list,
+    _compute_uncertainty_loss,
+    _eval_one_epoch,
+    _load_gt_from_meta,
+    _save_checkpoint,
+    _should_run_official_eval,
+)
 from lanemaster3d.models.losses.heteroscedastic import HeteroscedasticLaneUncertaintyLoss
 
 
 def _dummy_model() -> torch.nn.Module:
     return torch.nn.Linear(4, 2)
+
+
+def _cpu_ctx() -> DistContext:
+    return DistContext(enabled=False, rank=0, world_size=1, local_rank=0, device=torch.device("cpu"))
+
+
+def _dummy_batch(batch_size: int) -> dict[str, torch.Tensor]:
+    return {
+        "image": torch.zeros(batch_size, 3, 8, 8, dtype=torch.float32),
+        "gt_points": torch.zeros(batch_size, 1, 2, 3, dtype=torch.float32),
+        "lane_valid": torch.zeros(batch_size, 1, dtype=torch.float32),
+    }
+
+
+class _FakeEvalModel:
+    def eval(self) -> "_FakeEvalModel":
+        return self
+
+    def __call__(self, image: torch.Tensor, project_matrix=None) -> dict[str, torch.Tensor]:
+        batch_size = int(image.shape[0])
+        return {
+            "pred_points": torch.zeros(batch_size, 1, 2, 3, dtype=torch.float32),
+            "pred_scores": torch.zeros(batch_size, 1, dtype=torch.float32),
+        }
 
 
 def test_save_checkpoint_prefers_official_metric(tmp_path: Path) -> None:
@@ -92,3 +124,36 @@ def test_compute_uncertainty_loss_prefers_cached_matches(monkeypatch) -> None:
     )
     assert unc is not None
     assert torch.isfinite(unc)
+
+
+def test_eval_one_epoch_uses_sample_weighted_mean(monkeypatch) -> None:
+    metrics = [
+        {"f1": 100.0, "precision": 100.0, "recall": 100.0, "x_error": 1.0, "z_error": 1.0},
+        {"f1": 0.0, "precision": 0.0, "recall": 0.0, "x_error": 5.0, "z_error": 5.0},
+    ]
+
+    def _fake_eval_lane_batch(*_args, **_kwargs):
+        return metrics.pop(0)
+
+    monkeypatch.setattr(trainer, "evaluate_lane_batch", _fake_eval_lane_batch)
+    monkeypatch.setattr(trainer, "build_project_matrix", lambda _batch: None)
+    monkeypatch.setattr(trainer, "to_device", lambda batch, _device: batch)
+    model = _FakeEvalModel()
+    loader = [_dummy_batch(1), _dummy_batch(3)]
+
+    result = _eval_one_epoch(model, loader, _cpu_ctx())
+
+    assert abs(result["f1"] - 25.0) < 1e-6
+    assert abs(result["precision"] - 25.0) < 1e-6
+    assert abs(result["x_error"] - 4.0) < 1e-6
+
+
+def test_average_quick_metrics_supports_sample_weights() -> None:
+    metrics = [
+        {"f1": 100.0, "precision": 100.0, "recall": 100.0, "x_error": 1.0, "z_error": 1.0},
+        {"f1": 0.0, "precision": 0.0, "recall": 0.0, "x_error": 5.0, "z_error": 5.0},
+    ]
+    weighted = evaluator._average_quick_metrics(metrics, sample_counts=[1, 3])
+    assert abs(weighted["f1"] - 25.0) < 1e-6
+    assert abs(weighted["precision"] - 25.0) < 1e-6
+    assert abs(weighted["x_error"] - 4.0) < 1e-6

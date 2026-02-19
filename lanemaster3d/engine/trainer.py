@@ -397,13 +397,35 @@ def _reduce_metric(metric_sum: dict[str, float], sample_count: int, ctx: DistCon
     return {k: float(tensor[i].item() / denom) for i, k in enumerate(keys)}
 
 
+def _weighted_metric_sum(metrics: list[dict[str, float]], sample_counts: list[int]) -> tuple[dict[str, float], int]:
+    if not metrics:
+        return {}, 0
+    if len(metrics) != len(sample_counts):
+        raise ValueError("metrics 与 sample_counts 长度必须一致")
+    keys = sorted(metrics[0].keys())
+    metric_sum = {k: 0.0 for k in keys}
+    total_samples = 0
+    for metric, count in zip(metrics, sample_counts):
+        weight = max(int(count), 0)
+        if weight <= 0:
+            continue
+        total_samples += weight
+        for key in keys:
+            metric_sum[key] += float(metric.get(key, 0.0)) * float(weight)
+    return metric_sum, total_samples
+
+
 def _eval_one_epoch(model, loader: DataLoader, ctx: DistContext) -> dict[str, float]:
     model.eval()
     metrics = []
+    sample_counts = []
     with torch.no_grad():
         for batch in loader:
             batch = to_device(batch, ctx.device)
             _use_channels_last_on_batch(batch)
+            image = batch.get("image")
+            batch_size = int(image.shape[0]) if isinstance(image, torch.Tensor) and image.ndim > 0 else 1
+            sample_counts.append(batch_size)
             output = model(batch["image"], project_matrix=build_project_matrix(batch))
             metrics.append(
                 evaluate_lane_batch(
@@ -413,9 +435,8 @@ def _eval_one_epoch(model, loader: DataLoader, ctx: DistContext) -> dict[str, fl
                     batch["lane_valid"],
                 )
             )
-    mean_local = _average_metric_list(metrics)
-    metric_sum = {k: float(mean_local[k] * len(metrics)) for k in mean_local.keys()}
-    return _reduce_metric(metric_sum, len(metrics), ctx)
+    metric_sum, total_samples = _weighted_metric_sum(metrics, sample_counts)
+    return _reduce_metric(metric_sum, total_samples, ctx)
 
 
 def _load_gt_from_meta(meta: dict[str, str], cache: dict[str, dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:

@@ -150,11 +150,25 @@ def _build_prediction_lines(output: dict[str, torch.Tensor], metas: list[dict[st
     return predictions
 
 
-def _average_quick_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
+def _average_quick_metrics(metrics: list[dict[str, float]], sample_counts: list[int] | None = None) -> dict[str, float]:
     if not metrics:
         return {"f1": 0.0, "precision": 0.0, "recall": 0.0, "x_error": 0.0, "z_error": 0.0}
     keys = metrics[0].keys()
-    return {key: float(np.mean([m.get(key, 0.0) for m in metrics])) for key in keys}
+    if sample_counts is None:
+        return {key: float(np.mean([m.get(key, 0.0) for m in metrics])) for key in keys}
+    if len(sample_counts) != len(metrics):
+        raise ValueError("sample_counts 与 metrics 长度必须一致")
+    total_samples = float(sum(max(int(v), 0) for v in sample_counts))
+    if total_samples <= 0:
+        return {key: 0.0 for key in keys}
+    out = {key: 0.0 for key in keys}
+    for metric, count in zip(metrics, sample_counts):
+        weight = float(max(int(count), 0))
+        if weight <= 0:
+            continue
+        for key in keys:
+            out[key] += float(metric.get(key, 0.0)) * weight
+    return {key: float(out[key] / total_samples) for key in keys}
 
 
 def _reduce_quick_metrics(quick: dict[str, float], sample_count: int, ctx: DistContext) -> dict[str, float]:
@@ -208,12 +222,16 @@ def evaluate_model(
         model.eval()
         score_thresh = float(config["runtime"].get("score_threshold", 0.5))
         quick_metrics: list[dict[str, float]] = []
+        quick_sample_counts: list[int] = []
         predictions: list[dict[str, Any]] = []
         gt_map: dict[str, dict[str, Any]] = {}
         with torch.no_grad():
             for raw_batch in loader:
                 metas = raw_batch["meta"]
                 batch = to_device(raw_batch, ctx.device)
+                image = batch.get("image")
+                batch_size = int(image.shape[0]) if isinstance(image, torch.Tensor) and image.ndim > 0 else len(metas)
+                quick_sample_counts.append(max(batch_size, 0))
                 output = model(batch["image"], project_matrix=build_project_matrix(batch))
                 quick_metrics.append(
                     evaluate_lane_batch(
@@ -228,8 +246,8 @@ def evaluate_model(
                     file_path, gt = _load_gt_from_meta(meta, gt_map)
                     if gt is not None:
                         gt_map[file_path] = gt
-        quick_local = _average_quick_metrics(quick_metrics)
-        quick = _reduce_quick_metrics(quick_local, len(quick_metrics), ctx)
+        quick_local = _average_quick_metrics(quick_metrics, sample_counts=quick_sample_counts)
+        quick = _reduce_quick_metrics(quick_local, sum(quick_sample_counts), ctx)
         predictions, gt_map = _gather_eval_objects(predictions, gt_map, ctx)
         if not _is_main(ctx):
             return {}

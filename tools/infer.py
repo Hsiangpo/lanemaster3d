@@ -45,6 +45,33 @@ def _build_model(config: dict, device: torch.device) -> LaneMaster3DNet:
     return model.to(device)
 
 
+def _run_inference_batches(
+    model,
+    loader: torch.utils.data.DataLoader | list[dict[str, torch.Tensor]],
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    pred_points_list: list[torch.Tensor] = []
+    pred_scores_list: list[torch.Tensor] = []
+    with torch.no_grad():
+        for raw_batch in loader:
+            batch = to_device(raw_batch, device) if device is not None else raw_batch
+            project_matrix = None
+            if isinstance(batch, dict) and "cam_extrinsic" in batch and "cam_intrinsic" in batch:
+                project_matrix = build_project_matrix(batch)
+            output = model(batch["image"], project_matrix=project_matrix)
+            pred_points_list.append(output["pred_points"].detach().cpu())
+            pred_scores_list.append(output["pred_scores"].detach().cpu())
+    if not pred_points_list:
+        return {
+            "pred_points": torch.empty(0, 0, 0, 0, dtype=torch.float32),
+            "pred_scores": torch.empty(0, 0, dtype=torch.float32),
+        }
+    return {
+        "pred_points": torch.cat(pred_points_list, dim=0),
+        "pred_scores": torch.cat(pred_scores_list, dim=0),
+    }
+
+
 def main() -> int:
     args = parse_args()
     config = load_python_config(args.config)
@@ -68,12 +95,9 @@ def main() -> int:
     )
     loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=openlane_collate)
     model.eval()
-    with torch.no_grad():
-        raw_batch = next(iter(loader))
-        batch = to_device(raw_batch, device)
-        pred = model(batch["image"], project_matrix=build_project_matrix(batch))
+    pred = _run_inference_batches(model, loader, device=device)
     torch.save(
-        {"pred_points": pred["pred_points"].cpu(), "pred_scores": pred["pred_scores"].cpu()},
+        pred,
         out_dir / "inference_output.pt",
     )
     print({"output": str(out_dir / "inference_output.pt")})
