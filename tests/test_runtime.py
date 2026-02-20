@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from lanemaster3d.command_builder import CommandBundle
@@ -40,3 +41,18 @@ def test_run_inference_batches_collects_all_batches() -> None:
     output = infer._run_inference_batches(_DummyInferModel(), loader)
     assert output["pred_points"].shape[0] == 3
     assert output["pred_scores"].shape[0] == 3
+
+
+def test_infer_resolve_device_validates_requested_gpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(ValueError):
+        infer._resolve_infer_device_and_gpus(2)
+
+
+def test_infer_resolve_device_respects_requested_gpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    device, active_gpus = infer._resolve_infer_device_and_gpus(3)
+    assert device.type == "cuda"
+    assert active_gpus == 3

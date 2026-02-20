@@ -45,6 +45,19 @@ def _build_model(config: dict, device: torch.device) -> LaneMaster3DNet:
     return model.to(device)
 
 
+def _resolve_infer_device_and_gpus(gpus: int) -> tuple[torch.device, int]:
+    if gpus < 0:
+        raise ValueError("--gpus must be >= 0")
+    if gpus == 0:
+        return torch.device("cpu"), 0
+    if not torch.cuda.is_available():
+        return torch.device("cpu"), 0
+    visible_gpus = int(torch.cuda.device_count())
+    if gpus > visible_gpus:
+        raise ValueError(f"--gpus={gpus} exceeds available GPU count {visible_gpus}")
+    return torch.device("cuda:0"), gpus
+
+
 def _run_inference_batches(
     model,
     loader: torch.utils.data.DataLoader | list[dict[str, torch.Tensor]],
@@ -78,10 +91,12 @@ def main() -> int:
     config = validate_config(config)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, active_gpus = _resolve_infer_device_and_gpus(int(args.gpus))
     model = _build_model(config, device)
     ckpt = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(ckpt["model"], strict=True)
+    if active_gpus > 1:
+        model = torch.nn.DataParallel(model, device_ids=list(range(active_gpus)))
     data_cfg = config["data"]
     dataset = OpenLaneDataset(
         data_root=data_cfg["data_root"],
@@ -93,7 +108,8 @@ def main() -> int:
         category_policy=data_cfg.get("category_policy", "preserve_21"),
         preindex_cache=bool(data_cfg.get("preindex_cache", True)),
     )
-    loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=openlane_collate)
+    batch_size = max(active_gpus, 1)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=openlane_collate)
     model.eval()
     pred = _run_inference_batches(model, loader, device=device)
     torch.save(

@@ -13,6 +13,7 @@ from lanemaster3d.engine.trainer import (
     _compute_uncertainty_loss,
     _eval_one_epoch,
     _load_gt_from_meta,
+    _resolve_quick_eval_plan,
     _save_checkpoint,
     _should_run_official_eval,
 )
@@ -157,3 +158,98 @@ def test_average_quick_metrics_supports_sample_weights() -> None:
     assert abs(weighted["f1"] - 25.0) < 1e-6
     assert abs(weighted["precision"] - 25.0) < 1e-6
     assert abs(weighted["x_error"] - 4.0) < 1e-6
+
+
+def test_runtime_defaults_should_disable_data_probe() -> None:
+    runtime = trainer._runtime({"runtime": {"seed": 1, "num_workers": 2, "batch_size": 4}})
+    assert bool(runtime["data_probe"]) is False
+    assert bool(runtime["quick_eval_distributed"]) is False
+    assert int(runtime["quick_eval_num_workers"]) == 0
+
+
+def test_resolve_quick_eval_plan_should_skip_non_main_rank_when_disabled() -> None:
+    runtime = {"quick_eval_distributed": False}
+    ctx = DistContext(enabled=True, rank=1, world_size=2, local_rank=1, device=torch.device("cpu"))
+    plan = _resolve_quick_eval_plan(runtime, ctx)
+    assert bool(plan.should_run) is False
+    assert bool(plan.use_distributed) is False
+
+
+def test_resolve_quick_eval_plan_should_run_main_rank_locally_when_disabled() -> None:
+    runtime = {"quick_eval_distributed": False}
+    ctx = DistContext(enabled=True, rank=0, world_size=2, local_rank=0, device=torch.device("cpu"))
+    plan = _resolve_quick_eval_plan(runtime, ctx)
+    assert bool(plan.should_run) is True
+    assert bool(plan.use_distributed) is False
+
+
+def test_resolve_quick_eval_plan_should_run_all_ranks_when_enabled() -> None:
+    runtime = {"quick_eval_distributed": True}
+    rank0 = DistContext(enabled=True, rank=0, world_size=2, local_rank=0, device=torch.device("cpu"))
+    rank1 = DistContext(enabled=True, rank=1, world_size=2, local_rank=1, device=torch.device("cpu"))
+    plan0 = _resolve_quick_eval_plan(runtime, rank0)
+    plan1 = _resolve_quick_eval_plan(runtime, rank1)
+    assert bool(plan0.should_run) is True
+    assert bool(plan0.use_distributed) is True
+    assert bool(plan1.should_run) is True
+    assert bool(plan1.use_distributed) is True
+
+
+def test_summarize_sample_timing_should_return_mean_and_max() -> None:
+    sample_timing = torch.tensor(
+        [
+            [0.1, 0.2, 0.3, 0.4, 1.0],
+            [0.3, 0.4, 0.5, 0.6, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    summary = trainer._summarize_sample_timing(sample_timing)
+    assert abs(summary["sample_time_ann_mean"] - 0.2) < 1e-6
+    assert abs(summary["sample_time_ann_max"] - 0.3) < 1e-6
+    assert abs(summary["sample_time_sample_total_mean"] - 1.5) < 1e-6
+    assert abs(summary["sample_time_sample_total_max"] - 2.0) < 1e-6
+
+
+def test_log_iter_should_write_stage_times_and_data_probe(tmp_path: Path) -> None:
+    log_file = tmp_path / "metrics.jsonl"
+    trainer._log_iter(
+        log_file=log_file,
+        rank=0,
+        epoch=0,
+        step=20,
+        total_step=100,
+        losses={"loss_total": 1.0},
+        lr=1e-4,
+        data_t=0.01,
+        iter_t=0.05,
+        stage_times={"time_forward": 0.02},
+        data_probe={"sample_time_image_mean": 0.003},
+    )
+    row = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert row["stage_times"]["time_forward"] == 0.02
+    assert row["data_probe"]["sample_time_image_mean"] == 0.003
+
+
+def test_build_dataset_should_pass_image_backend_and_data_probe(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _DummyDataset:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(trainer, "OpenLaneDataset", _DummyDataset)
+    cfg = {
+        "data": {
+            "data_root": "./data/OpenLane",
+            "train_list": "data_lists/training.txt",
+            "val_list": "data_lists/validation.txt",
+            "image_size": [720, 960],
+            "max_lanes": 24,
+            "num_points": 20,
+            "image_backend": "cv2",
+        }
+    }
+    runtime = {"data_probe": True}
+    _ = trainer._build_dataset(cfg, "train", runtime)
+    assert captured["image_backend"] == "cv2"
+    assert captured["enable_timing_probe"] is True

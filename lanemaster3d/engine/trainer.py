@@ -30,8 +30,24 @@ class DistContext:
     local_rank: int
     device: torch.device
 
+
+@dataclass(frozen=True)
+class QuickEvalPlan:
+    should_run: bool
+    use_distributed: bool
+
 def _is_main(ctx: DistContext) -> bool:
     return ctx.rank == 0
+
+
+def _resolve_quick_eval_plan(runtime: dict, ctx: DistContext) -> QuickEvalPlan:
+    use_distributed = bool(runtime.get("quick_eval_distributed", False)) and ctx.enabled
+    if use_distributed:
+        return QuickEvalPlan(should_run=True, use_distributed=True)
+    if ctx.enabled and not _is_main(ctx):
+        return QuickEvalPlan(should_run=False, use_distributed=False)
+    return QuickEvalPlan(should_run=True, use_distributed=False)
+
 
 def _runtime(config: dict) -> dict:
     runtime = dict(config["runtime"])
@@ -62,6 +78,12 @@ def _runtime(config: dict) -> dict:
     runtime.setdefault("val_prefetch_factor", max(int(runtime.get("prefetch_factor", 2)) // 2, 2))
     runtime.setdefault("official_eval_prefetch_factor", int(runtime["val_prefetch_factor"]))
     runtime.setdefault("official_eval_interval", 1)
+    runtime.setdefault("data_probe", False)
+    runtime.setdefault("quick_eval_distributed", False)
+    runtime.setdefault("quick_eval_num_workers", 0)
+    runtime.setdefault("quick_eval_persistent_workers", False)
+    runtime.setdefault("quick_eval_batch_size_per_gpu", int(runtime["val_batch_size_per_gpu"]))
+    runtime.setdefault("quick_eval_prefetch_factor", int(runtime["val_prefetch_factor"]))
     return runtime
 def _setup_distributed(config: dict, launcher: str, device: str) -> DistContext:
     if launcher != "ddp":
@@ -104,9 +126,10 @@ def _setup_acceleration(runtime: dict, device: torch.device) -> None:
             torch.backends.cudnn.allow_tf32 = True
 
 
-def _build_dataset(config: dict, split: str) -> OpenLaneDataset:
+def _build_dataset(config: dict, split: str, runtime: dict | None = None) -> OpenLaneDataset:
     data_cfg = config["data"]
     list_path = data_cfg["train_list"] if split == "train" else data_cfg["val_list"]
+    enable_timing_probe = bool(runtime.get("data_probe", False)) if (runtime is not None and split == "train") else False
     return OpenLaneDataset(
         data_root=data_cfg["data_root"],
         list_path=list_path,
@@ -116,11 +139,13 @@ def _build_dataset(config: dict, split: str) -> OpenLaneDataset:
         camera_param_policy=data_cfg.get("camera_param_policy", "strict"),
         category_policy=data_cfg.get("category_policy", "preserve_21"),
         preindex_cache=bool(data_cfg.get("preindex_cache", True)),
+        image_backend=str(data_cfg.get("image_backend", "pil")),
+        enable_timing_probe=enable_timing_probe,
     )
 
 
 def _build_loader(config: dict, split: str, ctx: DistContext, runtime: dict) -> tuple[DataLoader, DistributedSampler | None]:
-    dataset = _build_dataset(config, split)
+    dataset = _build_dataset(config, split, runtime)
     sampler = DistributedSampler(dataset, shuffle=(split == "train")) if ctx.enabled else None
     if split == "train":
         workers = int(runtime["num_workers"])
@@ -148,6 +173,31 @@ def _build_loader(config: dict, split: str, ctx: DistContext, runtime: dict) -> 
         **kwargs,
     )
     return loader, sampler
+
+
+def _build_quick_val_loader(config: dict, runtime: dict) -> DataLoader:
+    dataset = _build_dataset(config, "val")
+    workers = int(runtime.get("quick_eval_num_workers", runtime.get("val_num_workers", runtime.get("num_workers", 0))))
+    kwargs = {
+        "batch_size": int(
+            runtime.get(
+                "quick_eval_batch_size_per_gpu",
+                runtime.get("val_batch_size_per_gpu", runtime.get("batch_size_per_gpu", runtime.get("batch_size", 4))),
+            )
+        ),
+        "shuffle": False,
+        "num_workers": workers,
+        "pin_memory": bool(runtime["pin_memory"]),
+        "persistent_workers": bool(runtime.get("quick_eval_persistent_workers", False)) and workers > 0,
+        "collate_fn": openlane_collate,
+    }
+    if workers > 0:
+        kwargs["prefetch_factor"] = int(
+            runtime.get("quick_eval_prefetch_factor", runtime.get("val_prefetch_factor", runtime.get("prefetch_factor", 2)))
+        )
+    return DataLoader(dataset, **kwargs)
+
+
 def _build_model(config: dict, ctx: DistContext):
     model_cfg = config["model"]
     innovation = config["innovation"]
@@ -551,7 +601,34 @@ def _save_checkpoint(
     return best
 
 
-def _log_iter(log_file: Path, rank: int, epoch: int, step: int, total_step: int, losses: dict[str, float], lr: float, data_t: float, iter_t: float):
+def _summarize_sample_timing(sample_timing: torch.Tensor | None) -> dict[str, float]:
+    if sample_timing is None or not isinstance(sample_timing, torch.Tensor) or sample_timing.numel() == 0:
+        return {}
+    tensor = sample_timing.detach().to(dtype=torch.float32, device="cpu")
+    names = ["ann", "image", "lanes", "camera", "sample_total"]
+    summary: dict[str, float] = {}
+    for idx, name in enumerate(names):
+        if idx >= int(tensor.shape[-1]):
+            break
+        column = tensor[:, idx]
+        summary[f"sample_time_{name}_mean"] = float(column.mean().item())
+        summary[f"sample_time_{name}_max"] = float(column.max().item())
+    return summary
+
+
+def _log_iter(
+    log_file: Path,
+    rank: int,
+    epoch: int,
+    step: int,
+    total_step: int,
+    losses: dict[str, float],
+    lr: float,
+    data_t: float,
+    iter_t: float,
+    stage_times: dict[str, float] | None = None,
+    data_probe: dict[str, float] | None = None,
+):
     payload = {
         "type": "iter",
         "rank": rank,
@@ -563,6 +640,10 @@ def _log_iter(log_file: Path, rank: int, epoch: int, step: int, total_step: int,
         "iter_time": iter_t,
         "losses": losses,
     }
+    if stage_times:
+        payload["stage_times"] = stage_times
+    if data_probe:
+        payload["data_probe"] = data_probe
     _append_jsonl(log_file, payload)
 
 
@@ -577,7 +658,12 @@ def train_model(config: dict, work_dir: str, launcher: str = "none", device: str
     logs_dir.mkdir(parents=True, exist_ok=True)
     metrics_log = logs_dir / "metrics.jsonl"
     train_loader, train_sampler = _build_loader(config, "train", ctx, runtime)
-    val_loader, val_sampler = _build_loader(config, "val", ctx, runtime)
+    quick_eval_plan = _resolve_quick_eval_plan(runtime, ctx)
+    if quick_eval_plan.use_distributed:
+        val_loader, val_sampler = _build_loader(config, "val", ctx, runtime)
+    else:
+        val_loader = _build_quick_val_loader(config, runtime) if quick_eval_plan.should_run else None
+        val_sampler = None
     model = _build_model(config, ctx)
     optimizer = _build_optimizer(config, model)
     scheduler = _build_scheduler(config, optimizer, int(runtime["epochs"]))
@@ -609,13 +695,25 @@ def train_model(config: dict, work_dir: str, launcher: str = "none", device: str
         for step, batch in enumerate(train_loader, start=1):
             data_t = time.time() - last_t
             global_step += 1
+            sample_timing = None
+            if isinstance(batch, dict):
+                sample_timing = batch.pop("sample_timing", None)
+            data_probe_summary = _summarize_sample_timing(sample_timing)
+
+            to_device_start = time.perf_counter()
             batch = to_device(batch, ctx.device)
             _use_channels_last_on_batch(batch)
+            time_to_device = time.perf_counter() - to_device_start
+
             autocast_kwargs: dict[str, torch.dtype] = {}
             if amp_enabled and autocast_device == "cuda":
                 autocast_kwargs["dtype"] = amp_dtype
+            forward_start = time.perf_counter()
             with torch.amp.autocast(autocast_device, enabled=amp_enabled, **autocast_kwargs):
                 output = model(batch["image"], project_matrix=build_project_matrix(batch))
+            time_forward = time.perf_counter() - forward_start
+
+            loss_start = time.perf_counter()
             with torch.amp.autocast(autocast_device, enabled=False):
                 total, losses = _compute_losses(
                     output=_cast_output_to_float32(output),
@@ -629,6 +727,7 @@ def train_model(config: dict, work_dir: str, launcher: str = "none", device: str
                     use_uncertainty=use_uncertainty,
                 )
                 total = total / accum_steps
+            time_loss = time.perf_counter() - loss_start
             finite_flag = torch.isfinite(total.detach()).to(dtype=torch.float32, device=ctx.device)
             if ctx.enabled:
                 dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
@@ -644,6 +743,7 @@ def train_model(config: dict, work_dir: str, launcher: str = "none", device: str
                 continue
             if step == 1:
                 optimizer.zero_grad(set_to_none=True)
+            backward_start = time.perf_counter()
             scaler.scale(total).backward()
             if step % accum_steps == 0 or step == len(train_loader):
                 if grad_clip > 0:
@@ -652,14 +752,43 @@ def train_model(config: dict, work_dir: str, launcher: str = "none", device: str
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+            time_backward = time.perf_counter() - backward_start
             iter_t = time.time() - last_t
             if _is_main(ctx) and step % int(runtime["log_interval"]) == 0:
                 loss_num = {k: float(v.detach().item()) for k, v in losses.items()}
                 loss_num["non_finite_steps"] = float(non_finite_steps)
-                _log_iter(metrics_log, ctx.rank, epoch, step, len(train_loader), loss_num, float(optimizer.param_groups[0]["lr"]), data_t, iter_t)
+                stage_times = {
+                    "time_to_device": float(time_to_device),
+                    "time_forward": float(time_forward),
+                    "time_loss": float(time_loss),
+                    "time_backward": float(time_backward),
+                }
+                _log_iter(
+                    metrics_log,
+                    ctx.rank,
+                    epoch,
+                    step,
+                    len(train_loader),
+                    loss_num,
+                    float(optimizer.param_groups[0]["lr"]),
+                    data_t,
+                    iter_t,
+                    stage_times=stage_times,
+                    data_probe=data_probe_summary,
+                )
             last_t = time.time()
         scheduler.step()
-        metric = _eval_one_epoch(model, val_loader, ctx)
+        metric: dict[str, float] = {}
+        if quick_eval_plan.should_run and val_loader is not None:
+            quick_eval_model = model if quick_eval_plan.use_distributed else _unwrap(model)
+            quick_eval_ctx = ctx if quick_eval_plan.use_distributed else DistContext(
+                enabled=False,
+                rank=ctx.rank,
+                world_size=1,
+                local_rank=ctx.local_rank,
+                device=ctx.device,
+            )
+            metric = _eval_one_epoch(quick_eval_model, val_loader, quick_eval_ctx)
         if _is_main(ctx):
             official_metric = None
             should_official = _should_run_official_eval(epoch, int(runtime["epochs"]), official_eval_interval)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -10,6 +12,11 @@ import torch
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
+
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
 
 DEFAULT_EXTRINSIC = np.eye(4, dtype=np.float32)
 DEFAULT_INTRINSIC = np.array(
@@ -76,10 +83,18 @@ def _resolve_image_path(data_root: Path, ann: Dict, item: str) -> Path | None:
     return None
 
 
-def _load_image(path: Path | None, image_size: Tuple[int, int]) -> tuple[Tensor, tuple[int, int]]:
+def _load_image(path: Path | None, image_size: Tuple[int, int], image_backend: str) -> tuple[Tensor, tuple[int, int]]:
     height, width = image_size
     if path is None or not path.exists():
         return torch.zeros(3, height, width, dtype=torch.float32), (height, width)
+    if image_backend == "cv2" and cv2 is not None:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is not None:
+            src_h, src_w = image.shape[:2]
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+            arr = image.astype(np.float32) / 255.0
+            return torch.from_numpy(arr).permute(2, 0, 1).contiguous(), (int(src_h), int(src_w))
     image = Image.open(path).convert("RGB")
     src_w, src_h = image.size
     image = image.resize((width, height))
@@ -211,29 +226,51 @@ def _preindex_cache_path(data_root: Path, list_path: str) -> Path:
     return data_root / ".cache" / cache_name
 
 
-def _load_preindex_cache(cache_path: Path) -> List[SampleEntry] | None:
+def _samples_fingerprint(samples: List[str]) -> str:
+    payload = "\n".join(samples).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _load_preindex_cache(cache_path: Path, samples: List[str]) -> List[SampleEntry] | None:
     if not cache_path.exists():
         return None
     try:
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(raw, list):
+    expected_fp = _samples_fingerprint(samples)
+    if isinstance(raw, dict):
+        entries_raw = raw.get("entries")
+        if not isinstance(entries_raw, list):
+            return None
+        if str(raw.get("samples_fingerprint", "")) != expected_fp:
+            return None
+    elif isinstance(raw, list):
+        entries_raw = raw
+    else:
         return None
     entries: List[SampleEntry] = []
-    for item in raw:
+    for item in entries_raw:
         if not isinstance(item, dict):
             return None
         entry = _entry_from_dict(item)
         if entry is None:
             return None
         entries.append(entry)
+    if len(entries) != len(samples):
+        return None
+    if [entry.item for entry in entries] != list(samples):
+        return None
     return entries
 
 
-def _write_preindex_cache(cache_path: Path, entries: List[SampleEntry]) -> None:
+def _write_preindex_cache(cache_path: Path, entries: List[SampleEntry], samples: List[str]) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [_entry_to_dict(entry) for entry in entries]
+    payload = {
+        "version": 2,
+        "samples_fingerprint": _samples_fingerprint(samples),
+        "entries": [_entry_to_dict(entry) for entry in entries],
+    }
     tmp_path = cache_path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(cache_path)
@@ -247,12 +284,12 @@ def _build_sample_entries(
 ) -> List[SampleEntry]:
     cache_path = _preindex_cache_path(data_root, list_path)
     if preindex_cache:
-        cached = _load_preindex_cache(cache_path)
-        if cached is not None and len(cached) == len(samples):
+        cached = _load_preindex_cache(cache_path, samples)
+        if cached is not None:
             return cached
     entries = [_build_sample_entry(data_root, item) for item in samples]
     if preindex_cache:
-        _write_preindex_cache(cache_path, entries)
+        _write_preindex_cache(cache_path, entries, samples)
     return entries
 
 
@@ -309,11 +346,15 @@ class OpenLaneDataset(Dataset):
         camera_param_policy: str = "strict",
         category_policy: str = "preserve_21",
         preindex_cache: bool = True,
+        image_backend: str = "pil",
+        enable_timing_probe: bool = False,
     ) -> None:
         if camera_param_policy not in {"strict", "fallback"}:
             raise ValueError("camera_param_policy 仅支持 strict/fallback")
         if category_policy not in {"preserve_21", "legacy_map_21_to_20"}:
             raise ValueError("category_policy 仅支持 preserve_21/legacy_map_21_to_20")
+        if image_backend not in {"pil", "cv2"}:
+            raise ValueError("image_backend 仅支持 pil/cv2")
         self.data_root = Path(data_root).resolve()
         self.samples = _read_list_file((self.data_root / list_path).resolve())
         self.sample_entries = _build_sample_entries(
@@ -327,6 +368,8 @@ class OpenLaneDataset(Dataset):
         self.num_points = num_points
         self.camera_param_policy = camera_param_policy
         self.category_policy = category_policy
+        self.image_backend = image_backend
+        self.enable_timing_probe = bool(enable_timing_probe)
 
     def __len__(self) -> int:
         return len(self.sample_entries)
@@ -335,16 +378,49 @@ class OpenLaneDataset(Dataset):
         entry = self.sample_entries[idx]
         item = entry.item
         ann_path = entry.ann_path
-        ann = _load_json(ann_path)
         img_path = entry.img_path
-        image, image_hw = _load_image(img_path, self.image_size)
-        src_h, src_w = _parse_src_image_hw(ann, image_hw)
-        gt_points, gt_vis, lane_valid, lane_category = _parse_lanes(
-            ann=ann,
-            max_lanes=self.max_lanes,
-            num_points=self.num_points,
-            category_policy=self.category_policy,
-        )
+        sample_timing = None
+        if self.enable_timing_probe:
+            start_t = time.perf_counter()
+            ann_start_t = time.perf_counter()
+            ann = _load_json(ann_path)
+            ann_t = time.perf_counter() - ann_start_t
+
+            image_start_t = time.perf_counter()
+            image, image_hw = _load_image(img_path, self.image_size, self.image_backend)
+            image_t = time.perf_counter() - image_start_t
+
+            lanes_start_t = time.perf_counter()
+            src_h, src_w = _parse_src_image_hw(ann, image_hw)
+            gt_points, gt_vis, lane_valid, lane_category = _parse_lanes(
+                ann=ann,
+                max_lanes=self.max_lanes,
+                num_points=self.num_points,
+                category_policy=self.category_policy,
+            )
+            lanes_t = time.perf_counter() - lanes_start_t
+
+            camera_start_t = time.perf_counter()
+            cam_extrinsic = _parse_cam_extrinsic(ann, self.camera_param_policy)
+            cam_intrinsic = _parse_cam_intrinsic(ann, self.camera_param_policy)
+            camera_t = time.perf_counter() - camera_start_t
+            total_t = time.perf_counter() - start_t
+            sample_timing = torch.tensor(
+                [ann_t, image_t, lanes_t, camera_t, total_t],
+                dtype=torch.float32,
+            )
+        else:
+            ann = _load_json(ann_path)
+            image, image_hw = _load_image(img_path, self.image_size, self.image_backend)
+            src_h, src_w = _parse_src_image_hw(ann, image_hw)
+            gt_points, gt_vis, lane_valid, lane_category = _parse_lanes(
+                ann=ann,
+                max_lanes=self.max_lanes,
+                num_points=self.num_points,
+                category_policy=self.category_policy,
+            )
+            cam_extrinsic = _parse_cam_extrinsic(ann, self.camera_param_policy)
+            cam_intrinsic = _parse_cam_intrinsic(ann, self.camera_param_policy)
         file_path = entry.file_path
         meta = {
             "sample_id": item,
@@ -352,21 +428,26 @@ class OpenLaneDataset(Dataset):
             "ann_path": str(ann_path) if ann_path is not None else "",
             "file_path": file_path,
         }
-        return {
+        output: Dict[str, Tensor | Dict[str, str]] = {
             "image": image,
             "gt_points": gt_points,
             "gt_vis": gt_vis,
             "lane_valid": lane_valid,
             "gt_category": lane_category,
-            "cam_extrinsic": _parse_cam_extrinsic(ann, self.camera_param_policy),
-            "cam_intrinsic": _parse_cam_intrinsic(ann, self.camera_param_policy),
+            "cam_extrinsic": cam_extrinsic,
+            "cam_intrinsic": cam_intrinsic,
             "src_img_hw": torch.tensor([float(src_h), float(src_w)], dtype=torch.float32),
             "meta": meta,
         }
+        if sample_timing is not None:
+            output["sample_timing"] = sample_timing
+        return output
 
 
 def openlane_collate(batch: List[Dict]) -> Dict[str, Tensor | List[Dict[str, str]]]:
     keys = ["image", "gt_points", "gt_vis", "lane_valid", "gt_category", "cam_extrinsic", "cam_intrinsic", "src_img_hw"]
     out = {key: torch.stack([item[key] for item in batch], dim=0) for key in keys}
+    if "sample_timing" in batch[0]:
+        out["sample_timing"] = torch.stack([item["sample_timing"] for item in batch], dim=0)
     out["meta"] = [item["meta"] for item in batch]
     return out

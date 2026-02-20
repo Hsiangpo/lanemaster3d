@@ -20,6 +20,17 @@
 - `pytest -q` or `pytest -q tests/test_openlane_dataset.py`  
   Run full or targeted test suites.
 
+## Remote Execution Rule (新增)
+训练、评测、推理一律按远端环境执行，不以本地开发机结果作为最终口径。  
+固定远端项目目录：`/home/sust/zhou/lanemaster3d`（详见 `docs/ops/server.md`）。  
+开训前必须先执行：
+- `bash scripts/remote/check_env.sh`
+- `bash scripts/remote/check_openlane_data.sh .`
+训练建议优先使用：
+- `bash scripts/train_dist.sh <config> <work_dir> <gpus>`
+- 或 `bash scripts/remote/start_train_tmux.sh <session> <config> <work_dir> <gpus>`
+若仅在本地执行命令，需明确标注该结果仅用于静态检查或命令拼装验证，不代表远端训练结论。
+
 ## Coding Style & Naming Conventions
 Use Python with 4-space indentation and UTF-8 encoding.  
 Use `snake_case` for functions/files/variables, `PascalCase` for classes, and `UPPER_SNAKE_CASE` for constants.  

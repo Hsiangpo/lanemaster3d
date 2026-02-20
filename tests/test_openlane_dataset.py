@@ -5,16 +5,21 @@ from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 
 from lanemaster3d.data import openlane_dataset as openlane_dataset_mod
 from lanemaster3d.data import OpenLaneDataset
 
 
-def _build_dataset_root(tmp_path: Path, ann: dict) -> Path:
+def _build_dataset_root(tmp_path: Path, ann: dict, with_image: bool = False) -> Path:
     data_root = tmp_path / "openlane"
     data_root.mkdir(parents=True, exist_ok=True)
     (data_root / "train.txt").write_text("sample.json\n", encoding="utf-8")
     (data_root / "sample.json").write_text(json.dumps(ann), encoding="utf-8")
+    if with_image:
+        images_dir = data_root / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 32), color=(64, 128, 192)).save(images_dir / "sample.jpg")
     return data_root
 
 
@@ -208,3 +213,110 @@ def test_dataset_preindex_cache_can_be_reused(tmp_path: Path, monkeypatch: pytes
     )
     sample = dataset2[0]
     assert float(sample["lane_valid"][0].item()) == 1.0
+
+
+def test_dataset_preindex_cache_should_invalidate_when_list_content_changes(tmp_path: Path) -> None:
+    data_root = tmp_path / "openlane"
+    data_root.mkdir(parents=True, exist_ok=True)
+    ann = {
+        "file_path": "images/sample.jpg",
+        "extrinsic": torch.eye(4).tolist(),
+        "intrinsic": [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]],
+        "lane_lines": [{"xyz": [[0.0, 0.1], [5.0, 10.0], [0.0, 0.0]], "visibility": [1.0, 1.0], "category": 1}],
+    }
+    (data_root / "sample_a.json").write_text(json.dumps(ann), encoding="utf-8")
+    (data_root / "sample_b.json").write_text(json.dumps(ann), encoding="utf-8")
+    (data_root / "train.txt").write_text("sample_a.json\n", encoding="utf-8")
+
+    dataset_a = OpenLaneDataset(
+        data_root=str(data_root),
+        list_path="train.txt",
+        image_size=(128, 256),
+        max_lanes=4,
+        num_points=6,
+        camera_param_policy="strict",
+        preindex_cache=True,
+    )
+    assert dataset_a.sample_entries[0].item == "sample_a.json"
+
+    (data_root / "train.txt").write_text("sample_b.json\n", encoding="utf-8")
+    dataset_b = OpenLaneDataset(
+        data_root=str(data_root),
+        list_path="train.txt",
+        image_size=(128, 256),
+        max_lanes=4,
+        num_points=6,
+        camera_param_policy="strict",
+        preindex_cache=True,
+    )
+    assert dataset_b.sample_entries[0].item == "sample_b.json"
+
+
+def test_dataset_timing_probe_should_emit_sample_timing(tmp_path: Path) -> None:
+    ann = {
+        "file_path": "images/sample.jpg",
+        "extrinsic": torch.eye(4).tolist(),
+        "intrinsic": [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]],
+        "lane_lines": [{"xyz": [[0.0, 0.1], [5.0, 10.0], [0.0, 0.0]], "visibility": [1.0, 1.0], "category": 1}],
+    }
+    data_root = _build_dataset_root(tmp_path, ann)
+    dataset = OpenLaneDataset(
+        data_root=str(data_root),
+        list_path="train.txt",
+        image_size=(128, 256),
+        max_lanes=4,
+        num_points=6,
+        camera_param_policy="strict",
+        enable_timing_probe=True,
+    )
+    sample = dataset[0]
+    assert "sample_timing" in sample
+    assert sample["sample_timing"].shape == (5,)
+    assert bool((sample["sample_timing"] >= 0).all().item())
+
+    batch = openlane_dataset_mod.openlane_collate([sample, sample])
+    assert "sample_timing" in batch
+    assert batch["sample_timing"].shape == (2, 5)
+
+
+def test_dataset_image_backend_invalid_should_raise(tmp_path: Path) -> None:
+    ann = {
+        "file_path": "images/sample.jpg",
+        "extrinsic": torch.eye(4).tolist(),
+        "intrinsic": [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]],
+        "lane_lines": [{"xyz": [[0.0, 0.1], [5.0, 10.0], [0.0, 0.0]], "visibility": [1.0, 1.0], "category": 1}],
+    }
+    data_root = _build_dataset_root(tmp_path, ann)
+    with pytest.raises(ValueError):
+        OpenLaneDataset(
+            data_root=str(data_root),
+            list_path="train.txt",
+            image_size=(128, 256),
+            max_lanes=4,
+            num_points=6,
+            camera_param_policy="strict",
+            image_backend="unknown",
+        )
+
+
+def test_dataset_image_backend_cv2_should_keep_image_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ann = {
+        "file_path": "images/sample.jpg",
+        "extrinsic": torch.eye(4).tolist(),
+        "intrinsic": [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]],
+        "lane_lines": [{"xyz": [[0.0, 0.1], [5.0, 10.0], [0.0, 0.0]], "visibility": [1.0, 1.0], "category": 1}],
+    }
+    data_root = _build_dataset_root(tmp_path, ann, with_image=True)
+    monkeypatch.setattr(openlane_dataset_mod, "cv2", None)
+    dataset = OpenLaneDataset(
+        data_root=str(data_root),
+        list_path="train.txt",
+        image_size=(32, 64),
+        max_lanes=4,
+        num_points=6,
+        camera_param_policy="strict",
+        image_backend="cv2",
+    )
+    sample = dataset[0]
+    assert sample["image"].shape == (3, 32, 64)
+    assert float(sample["image"].sum().item()) > 0.0
