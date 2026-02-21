@@ -5,6 +5,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,17 @@ def _resolve_quick_eval_plan(runtime: dict, ctx: DistContext) -> QuickEvalPlan:
     if ctx.enabled and not _is_main(ctx):
         return QuickEvalPlan(should_run=False, use_distributed=False)
     return QuickEvalPlan(should_run=True, use_distributed=False)
+
+
+def _resolve_ddp_timeout_seconds(config: dict) -> int:
+    dist_cfg = config.get("distributed", {})
+    runtime_cfg = config.get("runtime", {})
+    raw = dist_cfg.get("timeout_seconds", runtime_cfg.get("ddp_timeout_seconds", 7200))
+    try:
+        timeout_seconds = int(raw)
+    except (TypeError, ValueError):
+        timeout_seconds = 7200
+    return max(timeout_seconds, 600)
 
 
 def _runtime(config: dict) -> dict:
@@ -92,7 +104,12 @@ def _setup_distributed(config: dict, launcher: str, device: str) -> DistContext:
     dist_cfg = config.get("distributed", {})
     backend = dist_cfg.get("backend", "nccl" if torch.cuda.is_available() else "gloo")
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
+        timeout_seconds = _resolve_ddp_timeout_seconds(config)
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(seconds=timeout_seconds),
+        )
     rank = dist.get_rank()
     world = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))

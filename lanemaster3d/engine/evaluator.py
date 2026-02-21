@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +32,29 @@ def _is_main(ctx: DistContext) -> bool:
     return ctx.rank == 0
 
 
+def _resolve_ddp_timeout_seconds(config: dict) -> int:
+    dist_cfg = config.get("distributed", {})
+    runtime_cfg = config.get("runtime", {})
+    raw = dist_cfg.get("timeout_seconds", runtime_cfg.get("ddp_timeout_seconds", 7200))
+    try:
+        timeout_seconds = int(raw)
+    except (TypeError, ValueError):
+        timeout_seconds = 7200
+    return max(timeout_seconds, 600)
+
+
 def _setup_distributed(config: dict, launcher: str, device: str) -> DistContext:
     if launcher != "ddp":
         dev = torch.device(device if torch.cuda.is_available() else "cpu")
         return DistContext(False, 0, 1, 0, dev)
     backend = config.get("distributed", {}).get("backend", "nccl" if torch.cuda.is_available() else "gloo")
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
+        timeout_seconds = _resolve_ddp_timeout_seconds(config)
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(seconds=timeout_seconds),
+        )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))

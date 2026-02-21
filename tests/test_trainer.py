@@ -167,6 +167,23 @@ def test_runtime_defaults_should_disable_data_probe() -> None:
     assert int(runtime["quick_eval_num_workers"]) == 0
 
 
+def test_resolve_ddp_timeout_seconds_prefers_distributed_and_clamps_minimum() -> None:
+    timeout = trainer._resolve_ddp_timeout_seconds(
+        {
+            "distributed": {"timeout_seconds": 300},
+            "runtime": {"ddp_timeout_seconds": 1800},
+        }
+    )
+    assert int(timeout) == 600
+
+
+def test_resolve_ddp_timeout_seconds_should_fallback_to_runtime_then_default() -> None:
+    timeout_runtime = trainer._resolve_ddp_timeout_seconds({"runtime": {"ddp_timeout_seconds": 1800}})
+    timeout_default = trainer._resolve_ddp_timeout_seconds({})
+    assert int(timeout_runtime) == 1800
+    assert int(timeout_default) == 7200
+
+
 def test_resolve_quick_eval_plan_should_skip_non_main_rank_when_disabled() -> None:
     runtime = {"quick_eval_distributed": False}
     ctx = DistContext(enabled=True, rank=1, world_size=2, local_rank=1, device=torch.device("cpu"))
